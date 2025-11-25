@@ -5,6 +5,7 @@ from picamera2 import Picamera2
 import time
 import pickle
 from gpiozero import LED
+import serial
 
 # ============ LOAD ENCODINGS ============
 print("[INFO] loading encodings...")
@@ -25,6 +26,20 @@ picam2.start()
 # ============ GPIO ============
 output = LED(14)
 
+# ============ UART SETUP ============
+# Use /dev/serial0 by default on Raspberry Pi (mapped to main UART)
+# Make sure you enabled Serial in raspi-config and wiring matches your ESP32 RX/TX.
+try:
+    uart = serial.Serial(
+        port="/dev/serial0",  # adjust if needed, e.g. "/dev/ttyAMA0" or USB like "/dev/ttyUSB0"
+        baudrate=115200,
+        timeout=0.1
+    )
+    print("[INFO] UART initialized on /dev/serial0 at 115200 baud")
+except Exception as e:
+    uart = None
+    print(f"[WARN] Could not open UART: {e}")
+
 # ============ GLOBALS & SETTINGS ============
 cv_scaler = 4  # downscale factor for recognition (must be integer)
 
@@ -35,23 +50,57 @@ frame_count = 0
 start_time = time.time()
 fps = 0
 
-# This will hold coordinates & info for each detected face in full-resolution coords
-# Each item: {
-#   "name": str,
-#   "bbox": (left, top, right, bottom),
-#   "center": (cx, cy),
-#   "area": int
-# }
+# Each item:
+#   {
+#     "name": str,
+#     "bbox": (left, top, right, bottom),
+#     "center": (cx, cy),
+#     "area": int
+#   }
 face_coords = []
 
 # List of names that will trigger the GPIO pin
 authorized_names = ["john", "alice", "bob"]  # CASE-SENSITIVE
 
 
+def send_faces_over_uart(face_coords_list):
+    """
+    Send face coordinates to ESP32 over UART.
+
+    Protocol:
+      - One line per face:
+        FACE:<name>,<cx>,<cy>,<left>,<top>,<right>,<bottom>,<area>\n
+      - If no faces: NOFACE\n
+    """
+    if uart is None or not uart.is_open:
+        return  # UART not available
+
+    if not face_coords_list:
+        try:
+            uart.write(b"NOFACE\n")
+        except Exception:
+            pass
+        return
+
+    for fc in face_coords_list:
+        name = fc["name"]
+        (left, top, right, bottom) = fc["bbox"]
+        (cx, cy) = fc["center"]
+        area = fc["area"]
+
+        line = f"FACE:{name},{cx},{cy},{left},{top},{right},{bottom},{area}\n"
+        try:
+            uart.write(line.encode("utf-8"))
+        except Exception:
+            # Ignore UART write errors for now
+            pass
+
+
 def process_frame(frame):
     """
     Detect & recognize faces on a single frame.
     Also fills 'face_coords' with bbox + center + area in FULL-RES coordinates.
+    Sends coordinates via UART to ESP32.
     """
     global face_locations, face_encodings, face_names, face_coords
 
@@ -131,8 +180,7 @@ def process_frame(frame):
             }
         )
 
-    # OPTIONAL: print coordinates for debugging / future ESP32 integration
-    # You can later replace this with sending over UART/I2C/SPI to ESP32.
+    # Debug print
     if face_coords:
         print("Detected faces:")
         for fc in face_coords:
@@ -142,6 +190,11 @@ def process_frame(frame):
                 f"BBox: {fc['bbox']}, "
                 f"Area: {fc['area']}"
             )
+    else:
+        print("No faces detected")
+
+    # ====== SEND OVER UART ======
+    send_faces_over_uart(face_coords)
 
     return frame
 
@@ -206,38 +259,42 @@ def calculate_fps():
 
 
 # ============ MAIN LOOP ============
-while True:
-    # Capture a frame from camera
-    frame = picam2.capture_array()
+try:
+    while True:
+        # Capture a frame from camera
+        frame = picam2.capture_array()
 
-    # Process the frame: detect, recognize, fill face_coords
-    processed_frame = process_frame(frame)
+        # Process the frame: detect, recognize, fill face_coords & send via UART
+        processed_frame = process_frame(frame)
 
-    # Draw result boxes with distance-based colors
-    display_frame = draw_results(processed_frame)
+        # Draw result boxes with distance-based colors
+        display_frame = draw_results(processed_frame)
 
-    # Calculate and update FPS
-    current_fps = calculate_fps()
+        # Calculate and update FPS
+        current_fps = calculate_fps()
 
-    # Attach FPS counter to the text and boxes
-    cv2.putText(
-        display_frame,
-        f"FPS: {current_fps:.1f}",
-        (display_frame.shape[1] - 200, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (0, 255, 0),
-        2,
-    )
+        # Attach FPS counter to the text and boxes
+        cv2.putText(
+            display_frame,
+            f"FPS: {current_fps:.1f}",
+            (display_frame.shape[1] - 200, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 255, 0),
+            2,
+        )
 
-    # Display video feed
-    cv2.imshow("Video", display_frame)
+        # Display video feed
+        cv2.imshow("Video", display_frame)
 
-    # Break the loop and stop the script if 'q' is pressed
-    if cv2.waitKey(1) == ord("q"):
-        break
+        # Break the loop and stop the script if 'q' is pressed
+        if cv2.waitKey(1) == ord("q"):
+            break
 
-# Cleanup
-cv2.destroyAllWindows()
-picam2.stop()
-output.off()
+finally:
+    # Cleanup
+    cv2.destroyAllWindows()
+    picam2.stop()
+    output.off()
+    if uart is not None and uart.is_open:
+        uart.close()
