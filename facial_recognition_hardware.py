@@ -4,6 +4,7 @@ import numpy as np
 from picamera2 import Picamera2
 import time
 import pickle
+from gpiozero import LED
 import serial  # <-- UART
 
 # ============ LOAD ENCODINGS ============
@@ -15,233 +16,357 @@ known_face_names = data["names"]
 
 # ============ CAMERA SETUP ============
 picam2 = Picamera2()
-# Lower resolution for better performance
 picam2.configure(
     picam2.create_preview_configuration(
-        main={"format": "XRGB8888", "size": (1280, 720)}
+        main={"format": "XRGB8888", "size": (1920, 1080)}  # keep full HD
     )
 )
 picam2.start()
 
-# ============ UART SETUP ============
-PORT = "/dev/ttyAMA0"   # Raspberry Pi 5 UART
-BAUD = 115200
+# ============ GPIO ============
+output = LED(14)
 
-print(f"[INFO] Opening UART port {PORT} @ {BAUD} baud")
+# ============ UART SETUP ============
+UART_PORT = "/dev/ttyAMA0"   # Raspberry Pi 5 UART
+UART_BAUD = 115200
+
+print(f"[INFO] Opening UART port {UART_PORT} @ {UART_BAUD} baud")
+uart = None
+uart_ok = False
 try:
     uart = serial.Serial(
-        PORT,
-        BAUD,
+        UART_PORT,
+        UART_BAUD,
         timeout=0,        # non-blocking read
         write_timeout=0   # non-blocking write
     )
+    uart_ok = True
     print("[INFO] UART opened successfully.")
 except Exception as e:
     print("[ERROR] Could not open UART:", e)
-    uart = None  # continue without UART if it fails
+    uart_ok = False
+
+# Track last TX status for drawing UART logo
+last_uart_tx_time = 0.0
+last_uart_tx_had_face = False
 
 # ============ GLOBALS & SETTINGS ============
-cv_scaler = 4  # downscale factor for recognition
-process_every_n_frames = 3  # only do recognition every Nth frame
+cv_scaler = 4  # downscale factor for recognition (must be integer)
 
 face_locations = []
+face_encodings = []
 face_names = []
-
 frame_count = 0
 start_time = time.time()
 fps = 0
 
-# ============ FUNCTIONS ============
+# This will hold coordinates & info for each detected face in full-resolution coords
+# Each item: {
+#   "name": str,
+#   "bbox": (left, top, right, bottom),
+#   "center": (cx, cy),
+#   "area": int
+# }
+face_coords = []
 
-def recognize_faces(frame):
+# List of names that will trigger the GPIO pin
+authorized_names = ["john", "alice", "bob"]  # CASE-SENSITIVE
+
+
+def process_frame(frame):
     """
-    Run face detection + recognition on a single frame.
-    This is the heavy part and we call it only every Nth frame.
+    Detect & recognize faces on a single frame.
+    Also fills 'face_coords' with bbox + center + area in FULL-RES coordinates.
     """
-    global face_locations, face_names
+    global face_locations, face_encodings, face_names, face_coords
 
-    # Resize the frame to speed up face detection/encoding
-    small_frame = cv2.resize(frame, (0, 0), fx=1.0 / cv_scaler, fy=1.0 / cv_scaler)
-
-    # Convert BGR (OpenCV) to RGB (face_recognition)
-    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-
-    # Detect face locations
-    face_locations_local = face_recognition.face_locations(rgb_small_frame)
-
-    # Compute encodings (use the SMALL model for speed)
-    face_encodings = face_recognition.face_encodings(
-        rgb_small_frame, face_locations_local, model="small"
+    # Resize the frame using cv_scaler to increase performance
+    resized_frame = cv2.resize(
+        frame, (0, 0), fx=(1.0 / cv_scaler), fy=(1.0 / cv_scaler)
     )
 
-    face_names_local = []
+    # Convert BGR (OpenCV) to RGB (face_recognition)
+    rgb_resized_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
+
+    # Find all the faces and face encodings in the current frame of video
+    face_locations = face_recognition.face_locations(rgb_resized_frame)
+
+    # Use the SMALL model for speed instead of 'large'
+    if face_locations:
+        face_encodings = face_recognition.face_encodings(
+            rgb_resized_frame, face_locations, model="small"
+        )
+    else:
+        face_encodings = []
+
+    face_names = []
+    authorized_face_detected = False
+
+    # Recognize each detected face
     for face_encoding in face_encodings:
-        # Compare with known faces
         matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
         name = "Unknown"
 
-        # Use the known face with the smallest distance
+        # Use the known face with the smallest distance to the new face
         face_distances = face_recognition.face_distance(
             known_face_encodings, face_encoding
         )
-        best_match_index = np.argmin(face_distances)
 
-        if matches[best_match_index]:
-            name = known_face_names[best_match_index]
+        if len(face_distances) > 0:
+            best_match_index = np.argmin(face_distances)
+            if matches[best_match_index]:
+                name = known_face_names[best_match_index]
+                # Check if the detected face is in our authorized list
+                if name in authorized_names:
+                    authorized_face_detected = True
 
-        face_names_local.append(name)
+        face_names.append(name)
 
-    # Update globals
-    face_locations[:] = face_locations_local
-    face_names[:] = face_names_local
+    # Control the GPIO pin based on face detection
+    if authorized_face_detected:
+        output.on()  # Turn on Pin
+    else:
+        output.off()  # Turn off Pin
+
+    # ====== BUILD FULL-RES FACE COORDINATES FOR ESP32 / SERVOS ======
+    face_coords = []  # clear previous frame data
+
+    if face_locations:
+        h, w, _ = frame.shape
+
+        for (top, right, bottom, left), name in zip(face_locations, face_names):
+            # Scale back up to original frame size
+            top_full = top * cv_scaler
+            right_full = right * cv_scaler
+            bottom_full = bottom * cv_scaler
+            left_full = left * cv_scaler
+
+            # Clamp values to frame boundaries (safety)
+            top_full = max(0, min(top_full, h - 1))
+            bottom_full = max(0, min(bottom_full, h - 1))
+            left_full = max(0, min(left_full, w - 1))
+            right_full = max(0, min(right_full, w - 1))
+
+            width = right_full - left_full
+            height = bottom_full - top_full
+            area = max(0, width * height)
+
+            # Center point of the face in full-resolution coordinates
+            cx = left_full + (width // 2)
+            cy = top_full + (height // 2)
+
+            face_coords.append(
+                {
+                    "name": name,
+                    "bbox": (left_full, top_full, right_full, bottom_full),
+                    "center": (cx, cy),
+                    "area": area,
+                }
+            )
+
+    # If you want verbose debug, uncomment:
+    # if face_coords:
+    #     print("Detected faces:")
+    #     for fc in face_coords:
+    #         print(
+    #             f"  Name: {fc['name']}, "
+    #             f"Center: {fc['center']}, "
+    #             f"BBox: {fc['bbox']}, "
+    #             f"Area: {fc['area']}"
+    #         )
+
+    return frame
+
+
+def send_first_face_over_uart():
+    """
+    Send data for the FIRST detected face over UART.
+
+    Format:
+      FACE,<name>,<cx>,<cy>,<width>,<height>\\n
+    If no face:
+      NOFACE\\n
+    """
+    global last_uart_tx_time, last_uart_tx_had_face
+
+    if not uart_ok or uart is None or not uart.is_open:
+        return
+
+    try:
+        if face_coords:
+            fc = face_coords[0]  # first detected face
+            name = fc["name"]
+            (cx, cy) = fc["center"]
+            (left, top, right, bottom) = fc["bbox"]
+            width = right - left
+            height = bottom - top
+
+            # Ensure name has no commas to keep CSV simple
+            safe_name = str(name).replace(",", "_")
+
+            message = f"FACE,{safe_name},{cx},{cy},{width},{height}\n"
+            last_uart_tx_had_face = True
+        else:
+            message = "NOFACE\n"
+            last_uart_tx_had_face = False
+
+        uart.write(message.encode("utf-8"))
+        last_uart_tx_time = time.time()
+        # Optional debug:
+        # print("[UART TX]", message.strip())
+    except Exception:
+        # Ignore UART exceptions to keep loop running
+        pass
+
+
+def draw_uart_logo(frame):
+    """
+    Draw a small 'serial communication logo' / indicator on the frame.
+    Color encodes UART status + recent TX status:
+
+      - Red   : UART error / not opened
+      - Green : UART OK, last TX had face
+      - Orange: UART OK, last TX was NOFACE
+      - Yellow: UART OK, but no TX recently
+    """
+    x, y = 40, 40
+    radius = 12
+
+    if not uart_ok or uart is None or not uart.is_open:
+        color = (0, 0, 255)        # RED -> UART error
+        text = "UART ERR"
+    else:
+        now = time.time()
+        if now - last_uart_tx_time < 0.3:  # recent TX in last 300 ms
+            if last_uart_tx_had_face:
+                color = (0, 255, 0)        # GREEN -> face data sent
+            else:
+                color = (0, 165, 255)      # ORANGE -> NOFACE sent
+        else:
+            color = (0, 255, 255)          # YELLOW -> idle
+        text = "UART"
+
+    # Circle icon
+    cv2.circle(frame, (x, y), radius, color, -1)
+
+    # Text next to icon
+    cv2.putText(
+        frame,
+        text,
+        (x + 20, y + 5),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        color,
+        2,
+    )
+
+    return frame
 
 
 def draw_results(frame):
     """
-    Draw boxes and labels for the last known face locations & names.
+    Draw face boxes and labels.
+    Nearest face (largest area) gets a different color.
+    Also draws UART logo.
     """
-    for (top, right, bottom, left), name in zip(face_locations, face_names):
-        # Scale back up face locations
-        top *= cv_scaler
-        right *= cv_scaler
-        bottom *= cv_scaler
-        left *= cv_scaler
+    if face_coords:
+        # Find the "nearest" face by largest area
+        max_area = max(fc["area"] for fc in face_coords)
 
-        # Draw a box around the face
-        cv2.rectangle(frame, (left, top), (right, bottom), (244, 42, 3), 2)
+        for fc in face_coords:
+            name = fc["name"]
+            left, top, right, bottom = fc["bbox"]
+            area = fc["area"]
 
-        # Draw a label above the face
-        cv2.rectangle(
-            frame,
-            (left - 3, top - 30),
-            (right + 3, top),
-            (244, 42, 3),
-            cv2.FILLED,
-        )
-        font = cv2.FONT_HERSHEY_DUPLEX
-        cv2.putText(frame, name, (left + 5, top - 7), font, 0.7, (255, 255, 255), 1)
+            # Nearest face (largest area) -> GREEN, others -> ORANGE
+            if area == max_area:
+                box_color = (0, 255, 0)      # GREEN for nearest face
+                label_color = (0, 255, 0)
+            else:
+                box_color = (0, 165, 255)    # ORANGE for other faces
+                label_color = (0, 165, 255)
+
+            # Draw a box around the face
+            cv2.rectangle(frame, (left, top), (right, bottom), box_color, 3)
+
+            # Draw label background
+            cv2.rectangle(
+                frame,
+                (left - 3, top - 35),
+                (right + 3, top),
+                box_color,
+                cv2.FILLED,
+            )
+            font = cv2.FONT_HERSHEY_DUPLEX
+            cv2.putText(frame, name, (left + 6, top - 8), font, 1.0, (255, 255, 255), 1)
+
+            # Add an indicator if the person is authorized
+            if name in authorized_names:
+                cv2.putText(
+                    frame,
+                    "Authorized",
+                    (left + 6, bottom + 23),
+                    font,
+                    0.6,
+                    label_color,
+                    1,
+                )
+
+    # Draw UART status/logo on top
+    frame = draw_uart_logo(frame)
 
     return frame
 
 
 def calculate_fps():
-    """
-    Simple FPS calculator updated once per second.
-    """
     global frame_count, start_time, fps
     frame_count += 1
     elapsed_time = time.time() - start_time
-    if elapsed_time > 1.0:
+    if elapsed_time > 1:
         fps = frame_count / elapsed_time
         frame_count = 0
         start_time = time.time()
     return fps
 
 
-def send_face_data_over_uart():
-    """
-    Send face coordinates over UART.
-
-    Format:
-      - If at least one face: "FACE,<cx>,<cy>,<w>,<h>\\n"
-      - If no face:           "NOFACE\\n"
-
-    Coordinates are in full-resolution pixels (1280x720).
-    Only the first detected face is used (for servo control).
-    """
-    if uart is None or not uart.is_open:
-        return
-
-    try:
-        if face_locations:
-            # Use the first face
-            top, right, bottom, left = face_locations[0]
-
-            # Scale back to original frame size
-            top *= cv_scaler
-            right *= cv_scaler
-            bottom *= cv_scaler
-            left *= cv_scaler
-
-            width = right - left
-            height = bottom - top
-            center_x = left + width // 2
-            center_y = top + height // 2
-
-            message = f"FACE,{center_x},{center_y},{width},{height}\n"
-        else:
-            message = "NOFACE\n"
-
-        uart.write(message.encode("utf-8"))
-        # Optional debug:
-        # print("[UART TX]", message.strip())
-    except Exception as e:
-        # Avoid crashing if UART has an issue
-        # print("[UART ERROR]", e)
-        pass
-
-
-def read_uart():
-    """
-    Non-blocking UART read (optional).
-    You can send commands from the ESP32 and handle them here.
-    """
-    if uart is None or not uart.is_open:
-        return
-
-    try:
-        line = uart.readline().decode("utf-8", errors="ignore").strip()
-        if line:
-            # For now, just print. You can parse commands if needed.
-            print("[UART RX]", line)
-    except Exception:
-        pass
-
-
 # ============ MAIN LOOP ============
-
-frame_index = 0
-
 while True:
-    # Capture a frame
+    # Capture a frame from camera
     frame = picam2.capture_array()
 
-    # Only run heavy face recognition every Nth frame
-    if frame_index % process_every_n_frames == 0:
-        recognize_faces(frame)
+    # Process the frame: detect, recognize, fill face_coords
+    processed_frame = process_frame(frame)
 
-    frame_index += 1
+    # Send first face data over UART (name + coordinates)
+    send_first_face_over_uart()
 
-    # Send face coordinates over UART (every frame, using latest detection)
-    send_face_data_over_uart()
+    # Draw result boxes and UART logo
+    display_frame = draw_results(processed_frame)
 
-    # Optionally read from UART (non-blocking)
-    read_uart()
-
-    # Draw results from the last recognition step
-    display_frame = draw_results(frame)
-
-    # FPS overlay
+    # Calculate and update FPS
     current_fps = calculate_fps()
+
+    # Attach FPS counter to the text and boxes
     cv2.putText(
         display_frame,
         f"FPS: {current_fps:.1f}",
         (display_frame.shape[1] - 200, 40),
         cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
+        1,
         (0, 255, 0),
         2,
     )
 
-    # Show the frame
+    # Display video feed
     cv2.imshow("Video", display_frame)
 
-    # Exit on 'q'
+    # Break the loop and stop the script if 'q' is pressed
     if cv2.waitKey(1) == ord("q"):
         break
 
 # Cleanup
 cv2.destroyAllWindows()
 picam2.stop()
+output.off()
 if uart is not None and uart.is_open:
     uart.close()
