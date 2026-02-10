@@ -327,6 +327,5 @@ The following images are **not** photos of BHFR3 itself, but **reference robotic
   - These are **reference images of robotic heads from random clips**, included only for documentation and design inspiration.
   - They **do not** necessarily depict the physical BHFR3 build itself.
 
-- Please add your preferred license (e.g., MIT, Apache-2.0) here to clarify reuse of the hardware design and code.
 
 
